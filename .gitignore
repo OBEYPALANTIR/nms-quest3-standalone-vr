@@ -1,0 +1,39 @@
+.DS_Store
+build/
+cache/
+downloads/
+third_party/
+games/
+*.key
+*.pem
+.env
+__pycache__/
+*.pyc
+
+# Personal and machine-specific files. Never commit these.
+*.local.h
+*.local.cmd
+steam-stage/
+*.vdf
+ssfn*
+loginusers*
+# Game content, saves, crash dumps and run logs. Users bring their own game files.
+*.hg
+*.dmp
+*.pak
+*.PAK
+*.mbin
+*.MBIN
+*.exml
+*.EXML
+*.mxml
+*.MXML
+*.dds
+*.DDS
+*.pftrace
+*.mp4
+# Built binaries. Build them with the scripts in tools/.
+*.exe
+*.dll
+*.apk
+*.so

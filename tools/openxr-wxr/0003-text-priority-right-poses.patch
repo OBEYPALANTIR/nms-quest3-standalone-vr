@@ -1,0 +1,455 @@
+--- a/src/WinXrApiUDP.cpp
++++ b/src/WinXrApiUDP.cpp
+@@ -97,6 +97,7 @@
+ // values as little-endian floats and ints; anything else is the space-separated text of 0.6
+ static const char kBinaryMagic[4] = { 'W', 'X', 'R', 7 };
+ static const int kMaxPoses = 256;
++static constexpr unsigned long long kTextFreshMs = 500;
+ 
+ namespace {
+ 
+@@ -106,6 +107,7 @@
+ 	const char* p;
+ 	const char* end;
+ 	bool ok = true;
++	bool exact = true;
+ 
+ 	bool Token(const char*& b, const char*& e)
+ 	{
+@@ -126,7 +128,9 @@
+ 		float value = 0;
+ 		if (!Token(b, e)) return 0;
+ 		if (b < e && *b == '+') b++;
+-		if (std::from_chars(b, e, value).ec != std::errc() || !std::isfinite(value)) {
++		const auto parsed = std::from_chars(b, e, value);
++		exact = exact && parsed.ptr == e;
++		if (parsed.ec != std::errc() || !std::isfinite(value)) {
+ 			ok = false;
+ 			return 0;
+ 		}
+@@ -139,7 +143,9 @@
+ 		int value = 0;
+ 		if (!Token(b, e)) return 0;
+ 		if (b < e && *b == '+') b++;
+-		if (std::from_chars(b, e, value).ec != std::errc()) {
++		const auto parsed = std::from_chars(b, e, value);
++		exact = exact && parsed.ptr == e;
++		if (parsed.ec != std::errc()) {
+ 			ok = false;
+ 			return 0;
+ 		}
+@@ -168,7 +174,7 @@
+ {
+ 	TextReader in{ buffer, buffer + length };
+ 	const char *b, *e;
+-	in.Token(b, e); // client name
++	out.client0 = in.Token(b, e) && e - b == 7 && std::memcmp(b, "CLIENT0", 7) == 0;
+ 
+ 	for (float& f : out.floats) f = in.Float();
+ 	out.frameId = in.Int();
+@@ -190,6 +196,7 @@
+ 		pose.baseSpace = in.Int();
+ 		for (float& f : pose.pose) f = in.Float();
+ 		for (float& f : pose.velocity) f = in.Float();
++		pose.complete = in.ok && in.exact;
+ 		out.poses.push_back(pose);
+ 	}
+ }
+@@ -207,6 +214,7 @@
+ 	if (count > kMaxPoses) count = kMaxPoses;
+ 	for (int i = 0; i < count; i++) {
+ 		WxrHostPose pose;
++		pose.complete = in.end - in.p >= 16 * sizeof(int32_t);
+ 		pose.space = in.Read<int32_t>();
+ 		pose.baseSpace = in.Read<int32_t>();
+ 		for (float& f : pose.pose) f = in.Read<float>();
+@@ -278,6 +286,49 @@
+ 	cv.notify_all();
+ }
+ 
++WinXrApiUDP::RightPoseRole WinXrApiUDP::ResolveRightPoseRole(int hand, std::string_view binding)
++{
++	if (hand != 2) return RightPoseRole::Other;
++	if (binding == "/user/hand/right/input/aim/pose") return RightPoseRole::Aim;
++	if (binding == "/user/hand/right/input/grip/pose") return RightPoseRole::Grip;
++	return RightPoseRole::Other;
++}
++
++WinXrApiUDP::PoseSource WinXrApiUDP::GetPreferredRightPose(int space, int baseSpace, WxrHostPose& out, bool allowBinary)
++{
++	std::lock_guard<std::mutex> lock(mtx);
++	if (!actionSpaces.count(space)) return PoseSource::Missing;
++
++	auto read = [&](const WxrHostState& sample) {
++		for (const WxrHostPose& pose : sample.poses) {
++			if (pose.space != space || pose.baseSpace != baseSpace || !pose.complete) continue;
++			if (!std::all_of(std::begin(pose.pose), std::end(pose.pose),
++			                 [](float value) { return std::isfinite(value); })) continue;
++			if (!std::all_of(std::begin(pose.velocity), std::end(pose.velocity),
++			                 [](float value) { return std::isfinite(value); })) continue;
++			const float flags = pose.velocity[0];
++			if (flags < 0 || flags > 3 || flags != std::trunc(flags)) continue;
++
++			// Four-decimal CLIENT0 components can perturb unit length by at
++			// most 0.0001. Accept a small margin, then normalize the pose.
++			constexpr double tolerance = 0.001;
++			double normSquared = 0;
++			for (int i = 3; i < 7; ++i) normSquared += double(pose.pose[i]) * pose.pose[i];
++			if (normSquared < (1 - tolerance) * (1 - tolerance) ||
++			    normSquared > (1 + tolerance) * (1 + tolerance)) continue;
++			out = pose;
++			const double norm = std::sqrt(normSquared);
++			for (int i = 3; i < 7; ++i) out.pose[i] /= norm;
++			return true;
++		}
++		return false;
++	};
++	// Read-time freshness prevents a diagnostic sample sticking when the sender stops.
++	if (hasInject && injectState.client0 && GetTickCount64() - stats.lastTextMs < kTextFreshMs &&
++	    read(injectState)) return PoseSource::Text;
++	return allowBinary && read(hostState) ? PoseSource::Host : PoseSource::Missing;
++}
++
+ void WinXrApiUDP::RegisterActionSpace(int space)
+ {
+ 	std::lock_guard<std::mutex> lock(mtx);
+@@ -316,7 +367,7 @@
+ {
+ 	const bool merge = sourcePolicy.load() == 1;
+ 	const bool hostFresh = hasHost && (nowMs - stats.lastBinMs) < 1000;
+-	const bool injectFresh = hasInject && (nowMs - stats.lastTextMs) < 500;
++	const bool injectFresh = hasInject && (nowMs - stats.lastTextMs) < kTextFreshMs;
+ 
+ 	if (!hostFresh) {
+ 		// No host (or it stopped): fall back to whatever arrived, so the game never waits forever
+--- a/src/WinXrApiUDP.h
++++ b/src/WinXrApiUDP.h
+@@ -29,6 +29,7 @@
+ #include <cstddef>
+ #include <atomic>
+ #include <unordered_set>
++#include <string_view>
+ #include <vector>
+ 
+ // One pair of spaces the host located
+@@ -37,6 +38,7 @@
+ 	int baseSpace = 0;
+ 	float pose[7] = {};     // position xyz, orientation xyzw; an all-zero orientation means not located
+ 	float velocity[7] = {}; // XrSpaceVelocityFlags, linear xyz, angular xyz
++	bool complete = true;
+ };
+ 
+ // The host's tracking packet, read once when it arrives instead of on every xrWaitFrame
+@@ -46,6 +48,7 @@
+ 	int recenterId = 0;
+ 	bool buttons[19] = {};
+ 	std::vector<WxrHostPose> poses;
++	bool client0 = false;
+ };
+ 
+ class WinXrApiUDP
+@@ -74,6 +77,21 @@
+ 	// 2 = host_only: text packets are ignored while a binary packet arrived in the last second
+ 	void SetSourcePolicy(int policy) { sourcePolicy = policy; }
+ 	int GetSourcePolicy() const { return sourcePolicy; }
++	enum class PoseSource { Missing = 1, Host = 2, Text = 4 };
++	enum class RightPoseRole { Other, Aim, Grip };
++	static RightPoseRole ResolveRightPoseRole(int hand, std::string_view binding);
++	static constexpr unsigned PreferredPoseVelocityFlags(PoseSource source, unsigned flags,
++	                                                    bool translatedOffset) {
++		// Velocity describes the sampled origin. A translated action space has
++		// a different origin, so do not claim its untransformed linear velocity.
++		return source == PoseSource::Text && translatedOffset ? flags & ~1u : flags;
++	}
++	// The WXR wire has velocity flags only. An accepted synthetic pose is tracked
++	// by the diagnostic source and uses the runtime's normal location flag mask.
++	static constexpr unsigned PreferredPoseLocationFlags(PoseSource source) {
++		return source == PoseSource::Missing ? 0 : 0xf;
++	}
++	PoseSource GetPreferredRightPose(int space, int baseSpace, WxrHostPose& out, bool allowBinary = true);
+ 	void RegisterActionSpace(int space);
+ 	void ForgetSpace(int space);
+ 	void ClearSpaces();
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -296,6 +296,8 @@
+ static bool sendHaptics = true;
+ // OXRWXR-NMS: 0 legacy, 1 merge (default), 2 host_only; conf.txt key tracking_source
+ static int trackingSourcePolicy = 1;
++static bool textPriorityRightPoses = false;
++static std::atomic<unsigned> rightPoseSources{0};  // Aim bits 0–2, grip bits 3–5.
+ 
+ static WinXrApiUDP* udpReader;
+ 
+@@ -539,6 +541,11 @@
+ // g_actionPaths alone cannot tell us which hand a query refers to.
+ static std::unordered_map<XrAction, std::vector<ActionBinding>> g_actionBindings;
+ static std::unordered_map<XrSpace, bool> g_controllerGrips;
++struct DiagnosticRightPoseSpace {
++    XrActionSpaceCreateInfo info;
++    WinXrApiUDP::RightPoseRole binaryRole;
++};
++static std::unordered_map<XrSpace, DiagnosticRightPoseSpace> g_diagnosticRightPoseSpaces;
+ static std::unordered_map<XrSpace, XrPosef> g_controllerPoses;
+ static std::unordered_map<XrSpace, int> g_controllerSpaces;
+ static std::unordered_map<XrPath, bool> g_interactionProfiles;
+@@ -547,6 +554,7 @@
+ static std::vector<XrPath> g_profileOrder;
+ // The profile the bindings were frozen to at xrAttachSessionActionSets
+ static XrPath g_activeProfile = XR_NULL_PATH;
++static bool g_diagnosticProfileAttached = false;
+ 
+ // Cache for controllers to be created
+ static std::unordered_map<XrSpace, XrActionSpaceCreateInfo> g_controllerInfo;
+@@ -574,12 +582,14 @@
+     // Detect controller subaction paths and register the space
+     bool controllerGrip = false;
+     bool controllerPalm = false;
++    std::string_view legacyBinding;
+     int controllerType = 0;  // 0=none, 1=left, 2=right
+     if (info->action != XR_NULL_PATH) {
+         if (rt::g_actionPaths.find(info->action) != rt::g_actionPaths.end()) {
+             auto it = rt::g_pathStrings.find(rt::g_actionPaths[info->action]);
+             if (it != rt::g_pathStrings.end()) {
+                 const std::string& pathStr = it->second;
++                legacyBinding = pathStr;
+ 		if (pathStr.find("/grip/") != std::string::npos) {
+                     controllerGrip = true;
+                 }
+@@ -609,6 +619,15 @@
+ 
+     if (controllerType > 0) {
+         rt::g_controllerGrips[*space] = controllerGrip;
++        if (textPriorityRightPoses && controllerType == 2) {
++            using Role = WinXrApiUDP::RightPoseRole;
++            auto binaryRole = WinXrApiUDP::ResolveRightPoseRole(controllerType, legacyBinding);
++            // With an explicit right subaction, a last suggestion for the
++            // left hand still drives the legacy grip bit, but not the hand.
++            if (legacyBinding == "/user/hand/left/input/aim/pose") binaryRole = Role::Aim;
++            if (legacyBinding == "/user/hand/left/input/grip/pose") binaryRole = Role::Grip;
++            rt::g_diagnosticRightPoseSpaces[*space] = {*info, binaryRole};
++        }
+         rt::g_controllerPoses[*space] = info->poseInActionSpace;
+         if (controllerPalm) {
+             // Where the Touch controller's palm pose sits from its grip pose: tilted 70 degrees about X
+@@ -621,6 +640,34 @@
+         rt::g_spacesChanged = true;
+     }
+     return controllerType > 0;
++}
++
++// Called under g_controllerMutex. A space may be registered before attachment,
++// so resolve the role at locate time against the profile actually selected.
++static WinXrApiUDP::RightPoseRole ResolveDiagnosticRightPoseRole(const XrActionSpaceCreateInfo& info) {
++    using Role = WinXrApiUDP::RightPoseRole;
++    if (!g_diagnosticProfileAttached || g_activeProfile == XR_NULL_PATH) return Role::Other;
++    const bool explicitRight = info.subactionPath != XR_NULL_PATH;
++    if (explicitRight) {
++        auto subaction = g_pathStrings.find(info.subactionPath);
++        if (subaction == g_pathStrings.end() || subaction->second != "/user/hand/right") return Role::Other;
++    }
++
++    auto bindings = g_actionBindings.find(info.action);
++    if (bindings == g_actionBindings.end()) return Role::Other;
++    const bool boundOnActive = std::any_of(bindings->second.begin(), bindings->second.end(),
++        [](const ActionBinding& bound) { return bound.profile == g_activeProfile; });
++    Role role = Role::Other;
++    for (const ActionBinding& bound : bindings->second) {
++        if (boundOnActive && bound.profile != g_activeProfile) continue;
++        auto path = g_pathStrings.find(bound.binding);
++        if (path == g_pathStrings.end()) return Role::Other;
++        if (explicitRight && path->second.rfind("/user/hand/left/", 0) == 0) continue;
++        const Role candidate = WinXrApiUDP::ResolveRightPoseRole(2, path->second);
++        if (candidate == Role::Other || (role != Role::Other && candidate != role)) return Role::Other;
++        role = candidate;
++    }
++    return role;
+ }
+ 
+ // xrSyncActions is the usual moment to register action spaces, but a game that reads the legacy
+@@ -1426,6 +1473,7 @@
+         hmdMake = "FORCE FIX HANDS";
+     }
+ 
++    textPriorityRightPoses = false;
+     //Load the config for the SimXR runtime
+     if (std::filesystem::exists(confPath) && std::filesystem::is_directory(confPath)) {
+         if (std::filesystem::exists(confFile) && std::filesystem::is_regular_file(confFile)) {
+@@ -1461,6 +1509,9 @@
+                     if (compareKey(line, "controller_profile")) {
+                         preferredProfile = line.substr(line.find('=') + 1);
+                     }
++                    if (compareKey(line, "text_priority_right_poses")) {
++                        textPriorityRightPoses = parseBool(line);
++                    }
+                     // OXRWXR-NMS: legacy | merge | host_only (see WinXrApiUDP.h)
+                     if (compareKey(line, "tracking_source")) {
+                         std::string v = line.substr(line.find('=') + 1);
+@@ -1483,11 +1534,13 @@
+         }
+     }
+ 
++    textPriorityRightPoses = textPriorityRightPoses && trackingSourcePolicy == 1;
+     Logf("[WinXrUDP] Starting UDP");
+     udpReader = new WinXrApiUDP();
+     udpReader->SetSourcePolicy(trackingSourcePolicy);
+     Logf("[SimXR] OXRWXR-NMS build %s %s: tracking_source=%s (0=legacy 1=merge 2=host_only)",
+          __DATE__, __TIME__, trackingSourcePolicy == 1 ? "merge" : (trackingSourcePolicy == 2 ? "host_only" : "legacy"));
++    if (textPriorityRightPoses) Log("[SimXR] text_priority_right_poses enabled");
+     if (!udpReader->HasSocket()) Log("[WinXrUDP] ERROR - could not bind the UDP port, is another VR process already running? No tracking data will arrive");
+     udpReader->SendData("0 0 2 0");
+ 
+@@ -1862,9 +1915,12 @@
+         std::lock_guard<std::mutex> lock(rt::g_controllerMutex);
+         rt::g_controllerSpaces.clear();
+         rt::g_controllerGrips.clear();
++        rt::g_diagnosticRightPoseSpaces.clear();
++        rt::g_diagnosticProfileAttached = false;
+         rt::g_controllerPoses.clear();
+         rt::g_controllerInfo.clear();
+         if (udpReader) udpReader->ClearSpaces();
++        rightPoseSources = 0;
+     }
+     rt::g_locateSpaces.clear();
+     {
+@@ -5556,6 +5612,7 @@
+         std::lock_guard<std::mutex> lock(rt::g_controllerMutex);
+         rt::g_controllerSpaces.erase(space);
+         rt::g_controllerGrips.erase(space);
++        rt::g_diagnosticRightPoseSpaces.erase(space);
+         rt::g_controllerPoses.erase(space);
+         rt::g_controllerInfo.erase(space);
+         if (udpReader) udpReader->ForgetSpace((int)(intptr_t)space);
+@@ -5599,16 +5656,52 @@
+ 
+     if (verboseLogging) Logf("[SimXR] xrLocateSpace: Looking for space=%d in baseSpace=%d", (uint64_t)space, (uint64_t)baseSpace);
+ 
++    WxrHostPose diagnosticPose;
++    XrPosef diagnosticActionOffset{};
++    auto diagnosticSource = WinXrApiUDP::PoseSource::Missing;
++    bool diagnosticRight = false;
++    if (textPriorityRightPoses && udpReader) {
++        std::lock_guard<std::mutex> controllers(rt::g_controllerMutex);
++        const auto registered = rt::g_diagnosticRightPoseSpaces.find(space);
++        const auto role = registered == rt::g_diagnosticRightPoseSpaces.end()
++            ? WinXrApiUDP::RightPoseRole::Other : rt::ResolveDiagnosticRightPoseRole(registered->second.info);
++        diagnosticRight = role != WinXrApiUDP::RightPoseRole::Other;
++        if (diagnosticRight) {
++            diagnosticSource = udpReader->GetPreferredRightPose((int)(intptr_t)space,
++                                                                (int)(intptr_t)baseSpace, diagnosticPose,
++                                                                role == registered->second.binaryRole);
++            diagnosticActionOffset = registered->second.info.poseInActionSpace;
++            const unsigned shift = role == WinXrApiUDP::RightPoseRole::Grip ? 3 : 0;
++            rightPoseSources.fetch_or(static_cast<unsigned>(diagnosticSource) << shift,
++                                      std::memory_order_relaxed);
++        }
++    }
++
+     std::lock_guard<std::mutex> lock(SpacePoseMutex);
+-    if (SpacePoses.find(key) != SpacePoses.end()) {
+-        location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+-                                  XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+-                                  XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+-                                  XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+-        location->pose = SpacePoses[key];
++    auto cachedPose = SpacePoses.find(key);
++    constexpr XrSpaceLocationFlags locatedFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
++                                                    XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
++                                                    XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
++                                                    XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
++    static_assert(WinXrApiUDP::PreferredPoseLocationFlags(WinXrApiUDP::PoseSource::Text) == locatedFlags);
++    location->locationFlags = diagnosticRight ? WinXrApiUDP::PreferredPoseLocationFlags(diagnosticSource)
++                                               : (cachedPose != SpacePoses.end() ? locatedFlags : 0);
++    const bool located = location->locationFlags != 0;
++    if (located) {
++        if (diagnosticRight) {
++            const float* p = diagnosticPose.pose;
++            const XrPosef sample = {{p[3], p[4], p[5], p[6]}, {p[0], p[1], p[2]}};
++            if (diagnosticSource == WinXrApiUDP::PoseSource::Text) {
++                // The shim supplies the controller pose in this base. Android
++                // has already applied the action offset to binary host poses.
++                XrPosef_Multiply(&location->pose, &sample, &diagnosticActionOffset);
++            } else {
++                location->pose = sample;
++            }
++        } else {
++            location->pose = cachedPose->second;
++        }
+     } else {
+-        // Default for invalid data
+-        location->locationFlags = 0;
+         location->pose.orientation = {0, 0, 0, 1};
+         location->pose.position = {0, 0, 0};
+     }
+@@ -5617,7 +5710,17 @@
+         if (next->type == XR_TYPE_SPACE_VELOCITY) {
+             auto* velocity = reinterpret_cast<XrSpaceVelocity*>(next);
+             auto it = SpaceVelocities.find(key);
+-            if (it != SpaceVelocities.end() && location->locationFlags) {
++            if (diagnosticRight && located) {
++                const float* v = diagnosticPose.velocity;
++                const XrVector3f& offset = diagnosticActionOffset.position;
++                const bool translated = offset.x != 0 || offset.y != 0 || offset.z != 0;
++                static_assert(XR_SPACE_VELOCITY_LINEAR_VALID_BIT == 1u);
++                velocity->velocityFlags = WinXrApiUDP::PreferredPoseVelocityFlags(
++                    diagnosticSource, static_cast<unsigned>(v[0]), translated);
++                velocity->linearVelocity = velocity->velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT
++                    ? XrVector3f{v[1], v[2], v[3]} : XrVector3f{};
++                velocity->angularVelocity = {v[4], v[5], v[6]};
++            } else if (!diagnosticRight && it != SpaceVelocities.end() && located) {
+                 velocity->velocityFlags = it->second.velocityFlags;
+                 velocity->linearVelocity = it->second.linearVelocity;
+                 velocity->angularVelocity = it->second.angularVelocity;
+@@ -5626,7 +5729,6 @@
+             }
+         }
+     }
+-
+     return XR_SUCCESS;
+ }
+ 
+@@ -5843,6 +5945,8 @@
+ static XrResult XRAPI_PTR xrSuggestInteractionProfileBindings_runtime(XrInstance, const XrInteractionProfileSuggestedBinding* bindings) {
+     if (!bindings) return XR_ERROR_VALIDATION_FAILURE;
+ 
++    std::unique_lock<std::mutex> lock(rt::g_controllerMutex, std::defer_lock);
++    if (textPriorityRightPoses) lock.lock();
+     for (int i = 0; i < bindings->countSuggestedBindings; i++) {
+         auto& binding = bindings->suggestedBindings[i];
+         if (rt::g_actionNames.find(binding.action) == rt::g_actionNames.end()) {
+@@ -5908,7 +6012,10 @@
+     Logf("[SimXR] xrAttachSessionActionSets: count=%u", info->countActionSets);
+ 
+     // Attaching freezes the bindings, so this is where the profile is chosen
++    std::unique_lock<std::mutex> lock(rt::g_controllerMutex, std::defer_lock);
++    if (textPriorityRightPoses) lock.lock();
+     rt::g_activeProfile = SelectInteractionProfile();
++    if (textPriorityRightPoses) rt::g_diagnosticProfileAttached = true;
+     auto profileIt = rt::g_pathStrings.find(rt::g_activeProfile);
+     Logf("[SimXR] xrAttachSessionActionSets: active interaction profile=%s",
+          profileIt != rt::g_pathStrings.end() ? profileIt->second.c_str() : "none");
+@@ -6481,6 +6588,15 @@
+     if (!info) return XR_ERROR_VALIDATION_FAILURE;
+ 
+     rt::DrainPendingControllers();
++    if (textPriorityRightPoses) {
++        const unsigned sources = rightPoseSources.exchange(0, std::memory_order_relaxed);
++        static unsigned logged = 0;
++        if (logged < 36000) {
++            ++logged;
++            Logf("[SimXR] RIGHT_POSE_SOURCE sync=%llu aim_mask=%u grip_mask=%u",
++                 (unsigned long long)g_syncCount, sources & 7, sources >> 3);
++        }
++    }
+     g_syncCount++;
+ 
+     return XR_SUCCESS;
+@@ -6495,6 +6611,8 @@
+     }
+     *path = (XrPath)hash;
+     // Store path string for controller detection
++    std::unique_lock<std::mutex> lock(rt::g_controllerMutex, std::defer_lock);
++    if (textPriorityRightPoses) lock.lock();
+     rt::g_pathStrings[*path] = pathString;
+     Logf("[SimXR] xrStringToPath: %s -> %llu", pathString, (unsigned long long)*path);
+     return XR_SUCCESS;

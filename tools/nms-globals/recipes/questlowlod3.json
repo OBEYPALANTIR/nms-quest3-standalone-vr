@@ -1,0 +1,146 @@
+[
+ {
+  "file": "GCENVIRONMENTGLOBALS.GLOBAL.EXML",
+  "template": "cGcEnvironmentGlobals",
+  "edits": [
+   {
+    "path": "LODSettings/Low/LODAdjust/LODAdjust[0]",
+    "type": "float",
+    "expected": "0.000000",
+    "value": "0.000000"
+   },
+   {
+    "path": "LODSettings/Low/LODAdjust/LODAdjust[1]",
+    "type": "float",
+    "expected": "0.000000",
+    "value": "0.000000"
+   },
+   {
+    "path": "LODSettings/Low/LODAdjust/LODAdjust[2]",
+    "type": "float",
+    "expected": "0.500000",
+    "value": "0.125000"
+   },
+   {
+    "path": "LODSettings/Low/LODAdjust/LODAdjust[3]",
+    "type": "float",
+    "expected": "1.000000",
+    "value": "0.250000"
+   },
+   {
+    "path": "LODSettings/Low/LODAdjust/LODAdjust[4]",
+    "type": "float",
+    "expected": "1.000000",
+    "value": "0.250000"
+   },
+   {
+    "path": "LODSettings/Low/MaxObjectDistanceOverride/MaxObjectDistanceOverride[0]",
+    "type": "int32",
+    "expected": "10",
+    "value": "3"
+   },
+   {
+    "path": "LODSettings/Low/MaxObjectDistanceOverride/MaxObjectDistanceOverride[1]",
+    "type": "int32",
+    "expected": "10",
+    "value": "3"
+   },
+   {
+    "path": "LODSettings/Low/MaxObjectDistanceOverride/MaxObjectDistanceOverride[2]",
+    "type": "int32",
+    "expected": "10",
+    "value": "3"
+   },
+   {
+    "path": "LODSettings/Low/MaxObjectDistanceOverride/MaxObjectDistanceOverride[3]",
+    "type": "int32",
+    "expected": "10",
+    "value": "3"
+   },
+   {
+    "path": "LODSettings/Low/MaxObjectDistanceOverride/MaxObjectDistanceOverride[4]",
+    "type": "int32",
+    "expected": "10",
+    "value": "3"
+   },
+   {
+    "path": "LODSettings/Low/MaxObjectDistanceOverride/MaxObjectDistanceOverride[5]",
+    "type": "int32",
+    "expected": "10",
+    "value": "3"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODHiddenRanges/RegionLODHiddenRanges[0]",
+    "type": "int32",
+    "expected": "3",
+    "value": "1"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODHiddenRanges/RegionLODHiddenRanges[1]",
+    "type": "int32",
+    "expected": "4",
+    "value": "1"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODHiddenRanges/RegionLODHiddenRanges[2]",
+    "type": "int32",
+    "expected": "9",
+    "value": "3"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODHiddenRanges/RegionLODHiddenRanges[3]",
+    "type": "int32",
+    "expected": "8",
+    "value": "2"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODHiddenRanges/RegionLODHiddenRanges[4]",
+    "type": "int32",
+    "expected": "7",
+    "value": "2"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODHiddenRanges/RegionLODHiddenRanges[5]",
+    "type": "int32",
+    "expected": "999",
+    "value": "999"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODRadius/RegionLODRadius[0]",
+    "type": "int32",
+    "expected": "3",
+    "value": "2"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODRadius/RegionLODRadius[1]",
+    "type": "int32",
+    "expected": "7",
+    "value": "4"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODRadius/RegionLODRadius[2]",
+    "type": "int32",
+    "expected": "13",
+    "value": "7"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODRadius/RegionLODRadius[3]",
+    "type": "int32",
+    "expected": "9",
+    "value": "5"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODRadius/RegionLODRadius[4]",
+    "type": "int32",
+    "expected": "7",
+    "value": "4"
+   },
+   {
+    "path": "LODSettings/Low/RegionLODRadius/RegionLODRadius[5]",
+    "type": "int32",
+    "expected": "10",
+    "value": "5"
+   }
+  ]
+ }
+]

@@ -1,0 +1,143 @@
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -2760,7 +2760,16 @@
+         lastRecenterID = recenterID;
+     }
+ 
+-    IPDVal = floats[8];
++    if (floats[8] < 0.02f) {
++        static bool loggedIpdFallback = false;
++        if (!loggedIpdFallback) {
++            Logf("[SimXR] IPD_FALLBACK_ACTIVE: host floats[8]=%.4f < 0.02m (3DoF mode), using 0.0630m fallback", floats[8]);
++            loggedIpdFallback = true;
++        }
++        IPDVal = 0.063f;
++    } else {
++        IPDVal = floats[8];
++    }
+     if ((FOVH < 0) || (FOVV < 0)) {
+        FOVH = floats[9] * toRadians;
+        FOVV = floats[10] * toRadians;
+@@ -4024,13 +4033,33 @@
+                          0, 0, nullptr, 0, nullptr, 1, &syncEnd);
+ 
+     // Blit left eye
++    const auto& rectL = vL.subImage.imageRect;
++    const auto& vRView = (proj.viewCount > 1) ? proj.views[1] : proj.views[0];
++    const auto& rectR = vRView.subImage.imageRect;
++    int32_t srcL_x0 = rectL.offset.x;
++    int32_t srcL_y0 = rectL.offset.y;
++    int32_t srcL_w  = (rectL.extent.width > 0) ? rectL.extent.width : (int32_t)eyeWidth;
++    int32_t srcL_h  = (rectL.extent.height > 0) ? rectL.extent.height : (int32_t)eyeHeight;
++    int32_t srcR_x0 = rectR.offset.x;
++    int32_t srcR_y0 = rectR.offset.y;
++    int32_t srcR_w  = (rectR.extent.width > 0) ? rectR.extent.width : (int32_t)eyeWidth;
++    int32_t srcR_h  = (rectR.extent.height > 0) ? rectR.extent.height : (int32_t)eyeHeight;
++    static int vkPreviewLogCount = 0;
++    if (vkPreviewLogCount < 5 || (vkPreviewLogCount % 300 == 0)) {
++        Logf("[SimXR] presentVulkanSwapchain(#%d): chL=%ux%u rectL=(%d,%d %dx%d layer=%u) chR=%ux%u rectR=(%d,%d %dx%d layer=%u)",
++             vkPreviewLogCount,
++             chL.width, chL.height, srcL_x0, srcL_y0, srcL_w, srcL_h, vL.subImage.imageArrayIndex,
++             chR->width, chR->height, srcR_x0, srcR_y0, srcR_w, srcR_h, vRView.subImage.imageArrayIndex);
++    }
++    vkPreviewLogCount++;
++
+     VkImageBlit leftBlit{};
+     leftBlit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+     leftBlit.srcSubresource.mipLevel = 0;
+-    leftBlit.srcSubresource.baseArrayLayer = 0;
++    leftBlit.srcSubresource.baseArrayLayer = vL.subImage.imageArrayIndex;
+     leftBlit.srcSubresource.layerCount = 1;
+-    leftBlit.srcOffsets[0] = { 0, 0, 0 };
+-    leftBlit.srcOffsets[1] = { (int32_t)eyeWidth, (int32_t)eyeHeight, 1 };
++    leftBlit.srcOffsets[0] = { srcL_x0, srcL_y0, 0 };
++    leftBlit.srcOffsets[1] = { srcL_x0 + srcL_w, srcL_y0 + srcL_h, 1 };
+     leftBlit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+     leftBlit.dstSubresource.mipLevel = 0;
+     leftBlit.dstSubresource.baseArrayLayer = 0;
+@@ -4043,33 +4072,34 @@
+ 
+     // Right eye
+     if ((rightImage != VK_NULL_HANDLE) && !monoRendering) {
++        if (rightImage != leftImage || vRView.subImage.imageArrayIndex != vL.subImage.imageArrayIndex) {
++            VkImageMemoryBarrier rightBarrier{};
++            rightBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++            rightBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++            rightBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++            rightBarrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            rightBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++            rightBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            rightBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            rightBarrier.image = rightImage;
++            rightBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            rightBarrier.subresourceRange.baseMipLevel = 0;
++            rightBarrier.subresourceRange.levelCount = 1;
++            rightBarrier.subresourceRange.baseArrayLayer = vRView.subImage.imageArrayIndex;
++            rightBarrier.subresourceRange.layerCount = 1;
+ 
+-        VkImageMemoryBarrier rightBarrier{};
+-        rightBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+-        rightBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+-        rightBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+-        rightBarrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+-        rightBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+-        rightBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+-        rightBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+-        rightBarrier.image = rightImage;
+-        rightBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+-        rightBarrier.subresourceRange.baseMipLevel = 0;
+-        rightBarrier.subresourceRange.levelCount = 1;
+-        rightBarrier.subresourceRange.baseArrayLayer = 0;
+-        rightBarrier.subresourceRange.layerCount = 1;
++            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                 0, 0, nullptr, 0, nullptr, 1, &rightBarrier);
++        }
+ 
+-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                             0, 0, nullptr, 0, nullptr, 1, &rightBarrier);
+-
+         // Blit right eye
+         VkImageBlit rightBlit{};
+         rightBlit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+         rightBlit.srcSubresource.mipLevel = 0;
+-        rightBlit.srcSubresource.baseArrayLayer = 0;
++        rightBlit.srcSubresource.baseArrayLayer = vRView.subImage.imageArrayIndex;
+         rightBlit.srcSubresource.layerCount = 1;
+-        rightBlit.srcOffsets[0] = { 0, 0, 0 };
+-        rightBlit.srcOffsets[1] = { (int32_t)eyeWidth, (int32_t)eyeHeight, 1 };
++        rightBlit.srcOffsets[0] = { srcR_x0, srcR_y0, 0 };
++        rightBlit.srcOffsets[1] = { srcR_x0 + srcR_w, srcR_y0 + srcR_h, 1 };
+         rightBlit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+         rightBlit.dstSubresource.mipLevel = 0;
+         rightBlit.dstSubresource.baseArrayLayer = 0;
+@@ -5610,7 +5640,12 @@
+             logged = true;
+             return XR_ERROR_RUNTIME_FAILURE;
+         }
+-        IPDVal = host.floats[8];
++        if (host.floats[8] < 0.02f) {
++            Logf("[SimXR] xrLocateViews IPD_FALLBACK_ACTIVE: host.floats[8]=%.4f < 0.02m (3DoF mode), using 0.0630m fallback", host.floats[8]);
++            IPDVal = 0.063f;
++        } else {
++            IPDVal = host.floats[8];
++        }
+         FOVH = host.floats[9] * toRadians;
+         FOVV = host.floats[10] * toRadians;
+     }
+@@ -5635,7 +5670,16 @@
+         float fovX = FOVH / 2.0f;
+         float fovY = FOVV / 2.0f;
+         views[i].fov = { -fovX, fovX, fovY, -fovY };
++    }
++    static int locateViewsLogCount = 0;
++    if (locateViewsLogCount < 5 || (locateViewsLogCount % 500 == 0)) {
++        Logf("[SimXR] xrLocateViews(#%d): IPDVal=%.4f L_pos=(%.4f,%.4f,%.4f) R_pos=(%.4f,%.4f,%.4f) L_ori=(%.3f,%.3f,%.3f,%.3f)",
++             locateViewsLogCount, IPDVal,
++             views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,
++             views[1].pose.position.x, views[1].pose.position.y, views[1].pose.position.z,
++             views[0].pose.orientation.x, views[0].pose.orientation.y, views[0].pose.orientation.z, views[0].pose.orientation.w);
+     }
++    locateViewsLogCount++;
+     return XR_SUCCESS;
+ }
+ 

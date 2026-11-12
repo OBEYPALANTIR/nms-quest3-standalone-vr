@@ -1,0 +1,111 @@
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -318,6 +318,8 @@
+ static int ViewportHeight = 720;
+ static int DirectEyeWidth = 0;   // Per-eye size for direct transport from the host (headset x render scale), 0 if none
+ static int DirectEyeHeight = 0;
++static int ConfEyeWidth = 0;     // Per-eye size from conf.txt eye_size, 0 if unset
++static int ConfEyeHeight = 0;
+ static bool BridgeReady();
+ 
+ static XrVector2f makeXrVector2f(float x, float y) {
+@@ -356,6 +358,46 @@
+     std::string compareToLower = compareTo;
+     std::transform(compareToLower.begin(), compareToLower.end(), compareToLower.begin(), [](unsigned char c) { return std::tolower(c); });
+     return key == compareToLower;
++}
++
++// eye_size=WxH: both even and within 64..4096, else rejected with the size left as it was
++static bool parseEyeSize(const std::string str, int& width, int& height) {
++    size_t pos = str.find('=');
++    if (pos == std::string::npos) return false;
++    const char* value = str.c_str() + pos + 1;
++    auto readDimension = [&value](int& dimension) {
++        while (std::isspace(static_cast<unsigned char>(*value))) ++value;
++        if (*value == '+') ++value;
++        if (*value < '0' || *value > '9') return false;
++        while (*value >= '0' && *value <= '9') {
++            // The previous value was at most 4096, so this step fits in int.
++            dimension = dimension * 10 + (*value++ - '0');
++            if (dimension > 4096) return false;
++        }
++        return dimension >= 64 && dimension % 2 == 0;
++    };
++    int w = 0, h = 0;
++    if (!readDimension(w) || *value++ != 'x' || !readDimension(h)) return false;
++    while (std::isspace(static_cast<unsigned char>(*value))) ++value;
++    if (*value != '\0') return false;
++    width = w;
++    height = h;
++    return true;
++}
++
++// Direct frames skip the preview window, so they can be the headset's own size; otherwise eye_size,
++// else half the screen (all of it in mono)
++static void recommendedEyeSize(bool direct, int& width, int& height) {
++    if (direct) { width = DirectEyeWidth; height = DirectEyeHeight; }
++    else if (ConfEyeWidth > 0) { width = ConfEyeWidth; height = ConfEyeHeight; }
++    else { width = monoRendering ? ViewportWidth : ViewportWidth / 2; height = ViewportHeight; }
++}
++
++// With eye_size the preview stays the screen and the blit scales each eye into its half; without
++// it the preview is both submitted eyes side by side, as before
++static void vulkanPreviewSize(uint32_t eyeWidth, uint32_t eyeHeight, uint32_t& width, uint32_t& height) {
++    if (ConfEyeWidth > 0) { width = (uint32_t)ViewportWidth; height = (uint32_t)ViewportHeight; }
++    else { width = eyeWidth * 2; height = eyeHeight; }
+ }
+ 
+ // Runtime state
+@@ -1455,6 +1497,14 @@
+                     }
+                     if (compareKey(line, "controller_profile")) {
+                         preferredProfile = line.substr(line.find('=') + 1);
++                    }
++                    if (compareKey(line, "eye_size")) {
++                        if (parseEyeSize(line, ConfEyeWidth, ConfEyeHeight)) {
++                            Logf("[SimXR] conf eye_size=%dx%d; Vulkan preview stays the screen, %dx%d",
++                                 ConfEyeWidth, ConfEyeHeight, ViewportWidth, ViewportHeight);
++                        } else {
++                            Logf("[SimXR] conf eye_size ignored: '%s' (need even WxH, each 64..4096)", line.c_str());
++                        }
+                     }
+                 }
+ 
+@@ -1630,19 +1680,21 @@
+     if (verboseLogging) Logf("[SimXR] xrEnumerateViewConfigurationViews called: viewType=%d, capacity=%u", (int)viewType, capacity);
+     if (count) *count = 2;
+     if (capacity >= 2 && views) {
+-        // Direct frames skip the preview window, so they can be the headset's own size instead of half the screen
+         bool direct = directTransport && DirectEyeWidth > 0 && DirectEyeHeight > 0 && BridgeReady();
++        int eyeWidth = 0, eyeHeight = 0;
++        recommendedEyeSize(direct, eyeWidth, eyeHeight);
+         static bool logged = false;
+         if (!logged) {
+-            Logf("[SimXR] Recommended eye size %dx%d (%s)", direct ? DirectEyeWidth : ViewportWidth / 2,
+-                 direct ? DirectEyeHeight : ViewportHeight, direct ? "direct transport" : "half the screen");
++            bool conf = !direct && ConfEyeWidth > 0;
++            Logf("[SimXR] Recommended eye size %dx%d (%s)", direct || conf ? eyeWidth : ViewportWidth / 2,
++                 eyeHeight, direct ? "direct transport" : conf ? "conf eye_size" : "half the screen");
+             logged = true;
+         }
+         for (uint32_t i = 0; i < 2; ++i) {
+             views[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+             views[i].next = nullptr;
+-            views[i].recommendedImageRectWidth = direct ? DirectEyeWidth : monoRendering ? ViewportWidth : ViewportWidth / 2;
+-            views[i].recommendedImageRectHeight = direct ? DirectEyeHeight : ViewportHeight;
++            views[i].recommendedImageRectWidth = eyeWidth;
++            views[i].recommendedImageRectHeight = eyeHeight;
+             views[i].recommendedSwapchainSampleCount = 1;
+             views[i].maxImageRectWidth = 4096; views[i].maxImageRectHeight = 4096; views[i].maxSwapchainSampleCount = 1;
+         }
+@@ -3772,7 +3824,9 @@
+     uint32_t eyeWidth = proj.views[0].subImage.imageRect.extent.width;
+     uint32_t eyeHeight = proj.views[0].subImage.imageRect.extent.height;
+     VkFormat displayFmt = VK_FORMAT_B8G8R8A8_UNORM;
+-    ensurePreviewSized(s, eyeWidth * 2, eyeHeight, displayFmt);
++    uint32_t previewWidth = 0, previewHeight = 0;
++    vulkanPreviewSize(eyeWidth, eyeHeight, previewWidth, previewHeight);
++    ensurePreviewSized(s, previewWidth, previewHeight, displayFmt);
+     if (!s.vkPreviewSwapchain) { Log("[SimXR] VK PREVIEW: No preview swapchain"); return; }
+ 
+ 

@@ -1,0 +1,601 @@
+--- a/src/WinXrApiUDP.cpp
++++ b/src/WinXrApiUDP.cpp
+@@ -32,6 +32,8 @@
+ #include <charconv>
+ #include <cmath>
+ #include <cstdint>
++#include <algorithm>
++#include <iterator>
+ 
+ WinXrApiUDP::WinXrApiUDP()
+ {
+@@ -224,21 +226,221 @@
+ 	scratch = WxrHostState{};
+ 	scratch.poses = std::move(poses);
+ 
+-	if (bytesReceived >= (int)sizeof(kBinaryMagic) && memcmp(buffer, kBinaryMagic, sizeof(kBinaryMagic)) == 0)
++	const bool isBinary = bytesReceived >= (int)sizeof(kBinaryMagic) && memcmp(buffer, kBinaryMagic, sizeof(kBinaryMagic)) == 0;
++	if (isBinary)
+ 		ParseBinary(buffer, bytesReceived, scratch);
+ 	else
+ 		ParseText(buffer, bytesReceived, scratch);
+ 
+-	if (LastOpenXRFrameID == scratch.frameId)
++	const int policy = sourcePolicy.load();
++	const unsigned long long nowMs = GetTickCount64();
++
++	if (policy == 0) {
++		// Upstream behaviour: whichever packet came last is the state
++		{
++			std::lock_guard<std::mutex> lock(mtx);
++			if (isBinary) { stats.binPackets++; stats.lastBinMs = nowMs; }
++			else { stats.textPackets++; stats.lastTextMs = nowMs; }
++		}
++		if (LastOpenXRFrameID == scratch.frameId)
++			return;
++
++		{
++			std::lock_guard<std::mutex> lock(mtx);
++			std::swap(state, scratch);
++			hasState = true;
++		}
++
++		cv.notify_all();
+ 		return;
++	}
+ 
+ 	{
+ 		std::lock_guard<std::mutex> lock(mtx);
+-		std::swap(state, scratch);
++		if (isBinary) {
++			stats.binPackets++;
++			stats.lastBinMs = nowMs;
++			hostState = scratch;
++			hasHost = true;
++		} else {
++			stats.textPackets++;
++			stats.lastTextMs = nowMs;
++			if (policy == 2 && hasHost && (nowMs - stats.lastBinMs) < 1000) {
++				stats.textDropped++;
++				return;
++			}
++			injectState = scratch;
++			hasInject = true;
++		}
++		Compose(nowMs);
+ 		hasState = true;
+ 	}
+-
+ 	cv.notify_all();
++}
++
++void WinXrApiUDP::RegisterActionSpace(int space)
++{
++	std::lock_guard<std::mutex> lock(mtx);
++	if (actionSpaces.insert(space).second)
++		ForgetSpacePoses(space);
++}
++
++void WinXrApiUDP::ForgetSpace(int space)
++{
++	std::lock_guard<std::mutex> lock(mtx);
++	actionSpaces.erase(space);
++	ForgetSpacePoses(space);
++}
++
++void WinXrApiUDP::ClearSpaces()
++{
++	std::lock_guard<std::mutex> lock(mtx);
++	actionSpaces.clear();
++	hostState.poses.clear();
++	injectState.poses.clear();
++	state.poses.clear();
++}
++
++// Called with mtx held. Purge samples that refer to an earlier lifetime of the handle.
++void WinXrApiUDP::ForgetSpacePoses(int space)
++{
++	for (auto* poses : { &hostState.poses, &injectState.poses, &state.poses }) {
++		poses->erase(std::remove_if(poses->begin(), poses->end(), [space](const WxrHostPose& pose) {
++			return pose.space == space || pose.baseSpace == space;
++		}), poses->end());
++	}
++}
++
++// Builds state from the host and injector packets per sourcePolicy. Called with mtx held.
++void WinXrApiUDP::Compose(unsigned long long nowMs)
++{
++	const bool merge = sourcePolicy.load() == 1;
++	const bool hostFresh = hasHost && (nowMs - stats.lastBinMs) < 1000;
++	const bool injectFresh = hasInject && (nowMs - stats.lastTextMs) < 500;
++
++	if (!hostFresh) {
++		// No host (or it stopped): fall back to whatever arrived, so the game never waits forever
++		state = hasInject ? injectState : hostState;
++		if (merge && hasInject) {
++			auto isReferencePair = [this](const WxrHostPose& pose) {
++				return pose.space != 0 && actionSpaces.count(pose.space) == 0;
++			};
++			auto& poses = state.poses;
++			poses.erase(std::remove_if(poses.begin(), poses.end(), isReferencePair), poses.end());
++			std::copy_if(hostState.poses.begin(), hostState.poses.end(),
++			             std::back_inserter(poses), isReferencePair);
++		}
++		return;
++	}
++
++	state = hostState;
++	if (!merge || !injectFresh)
++		return;
++
++	// Combine analog axes (max magnitude) and buttons (boolean OR) so idle vr_cmd zeros
++	// (sent at 500 Hz while active=1) never mask physical Quest Touch controller inputs.
++	bool injectHasControllerInput = false;
++	for (int i = 0; i < 8; i++) {
++		if (std::fabs(injectState.floats[i]) > 0.01f)
++			injectHasControllerInput = true;
++		if (std::fabs(injectState.floats[i]) > std::fabs(state.floats[i]))
++			state.floats[i] = injectState.floats[i];
++	}
++	for (int i = 0; i < 19; i++) {
++		if (injectState.buttons[i]) {
++			injectHasControllerInput = true;
++			state.buttons[i] = true;
++		}
++	}
++
++	// Check whether injectState specifies a non-identity synthetic HMD pose (e.g. a synthetic yaw test)
++	bool injectHasCustomHead = false;
++	for (const WxrHostPose& q : injectState.poses) {
++		if (q.space != 0) continue;
++		if (std::fabs(q.pose[0]) > 1e-4f || std::fabs(q.pose[1]) > 1e-4f || std::fabs(q.pose[2]) > 1e-4f ||
++		    std::fabs(q.pose[3]) > 1e-4f || std::fabs(q.pose[4]) > 1e-4f || std::fabs(q.pose[5]) > 1e-4f ||
++		    std::fabs(q.pose[6] - 1.0f) > 1e-4f) {
++			injectHasCustomHead = true;
++			break;
++		}
++	}
++
++	// Check if host has at least one non-identity head space (to distinguish STAGE/LOCAL from VIEW space)
++	bool hostHasNonIdentityHead = false;
++	for (const WxrHostPose& p : hostState.poses) {
++		if (p.space != 0) continue;
++		if (std::fabs(p.pose[0]) > 1e-4f || std::fabs(p.pose[1]) > 1e-4f || std::fabs(p.pose[2]) > 1e-4f ||
++		    std::fabs(p.pose[3]) > 1e-4f || std::fabs(p.pose[4]) > 1e-4f || std::fabs(p.pose[5]) > 1e-4f ||
++		    std::fabs(p.pose[6] - 1.0f) > 1e-4f) {
++			hostHasNonIdentityHead = true;
++			break;
++		}
++	}
++
++	auto isValidPose = [](const WxrHostPose& p) {
++		return !(p.pose[3] == 0.0f && p.pose[4] == 0.0f && p.pose[5] == 0.0f && p.pose[6] == 0.0f);
++	};
++	auto isNonOriginPose = [&](const WxrHostPose& p) {
++		return isValidPose(p) && (std::fabs(p.pose[0]) > 1e-4f || std::fabs(p.pose[1]) > 1e-4f || std::fabs(p.pose[2]) > 1e-4f ||
++		                          std::fabs(p.pose[3]) > 1e-4f || std::fabs(p.pose[4]) > 1e-4f || std::fabs(p.pose[5]) > 1e-4f ||
++		                          std::fabs(p.pose[6] - 1.0f) > 1e-4f);
++	};
++
++	std::vector<WxrHostPose> merged;
++	merged.reserve(hostState.poses.size() + injectState.poses.size());
++
++	for (const WxrHostPose& p : hostState.poses) {
++		if (p.space == 0) {
++			if (injectHasCustomHead) {
++				// Leave VIEW space (identity in host when other head spaces are non-identity) untouched
++				bool isViewSpace = hostHasNonIdentityHead && !isNonOriginPose(p);
++				if (!isViewSpace) {
++					for (const WxrHostPose& q : injectState.poses) {
++						if (q.space == 0 && q.baseSpace == p.baseSpace && isValidPose(q)) {
++							WxrHostPose rot = p;
++							rot.pose[0] += q.pose[0];
++							rot.pose[1] += q.pose[1];
++							rot.pose[2] += q.pose[2];
++							// Quaternion multiply: p.q * q.q
++							float ax = p.pose[3], ay = p.pose[4], az = p.pose[5], aw = p.pose[6];
++							float bx = q.pose[3], by = q.pose[4], bz = q.pose[5], bw = q.pose[6];
++							rot.pose[3] = aw * bx + ax * bw + ay * bz - az * by;
++							rot.pose[4] = aw * by - ax * bz + ay * bw + az * bx;
++							rot.pose[5] = aw * bz + ax * by - ay * bx + az * bw;
++							rot.pose[6] = aw * bw - ax * bx - ay * by - az * bz;
++							merged.push_back(rot);
++							goto next_host_pose;
++						}
++					}
++				}
++			}
++			merged.push_back(p);
++			next_host_pose:;
++			continue;
++		}
++		// Controller pose: keep host pose when physical controller is tracked and injector has no active input
++		bool overridden = false;
++		if (actionSpaces.count(p.space) && (injectHasControllerInput || !isNonOriginPose(p))) {
++			for (const WxrHostPose& q : injectState.poses) {
++				if (q.space == p.space && q.baseSpace == p.baseSpace && isValidPose(q)) {
++					overridden = true;
++					break;
++				}
++			}
++		}
++		if (!overridden) merged.push_back(p);
++	}
++
++	// Add any injector poses not already in merged
++	for (const WxrHostPose& q : injectState.poses) {
++		if ((q.space != 0 && !actionSpaces.count(q.space)) || !isValidPose(q)) continue;
++		bool exists = false;
++		for (const WxrHostPose& m : merged) {
++			if (m.space == q.space && m.baseSpace == q.baseSpace) { exists = true; break; }
++		}
++		if (!exists) merged.push_back(q);
++	}
++	state.poses = std::move(merged);
+ }
+ 
+ // Reads one packet on the calling thread, waiting up to timeoutMs for it
+--- a/src/WinXrApiUDP.h
++++ b/src/WinXrApiUDP.h
+@@ -28,6 +28,7 @@
+ #include <condition_variable>
+ #include <cstddef>
+ #include <atomic>
++#include <unordered_set>
+ #include <vector>
+ 
+ // One pair of spaces the host located
+@@ -64,7 +65,31 @@
+ 
+ 	int LastOpenXRFrameID = -1;
+ 
++	// OXRWXR-NMS: two senders can reach port 7872: the WinlatorXR host (binary 'WXR'7 packets,
++	// real tracking) and a test injector such as vk_shim's vr_cmd sender (text packets).
++	// 0 = legacy: the latest packet of either kind replaces the whole state (upstream behaviour)
++	// 1 = merge: head poses (space 0), IPD, FOV, refresh, frame and recenter ids from the host;
++	//     sticks, triggers, grips, buttons and controller pose pairs from the injector while it
++	//     has sent within the last 500 ms, otherwise from the host
++	// 2 = host_only: text packets are ignored while a binary packet arrived in the last second
++	void SetSourcePolicy(int policy) { sourcePolicy = policy; }
++	int GetSourcePolicy() const { return sourcePolicy; }
++	void RegisterActionSpace(int space);
++	void ForgetSpace(int space);
++	void ClearSpaces();
++	struct SourceStats { unsigned long long binPackets = 0, textPackets = 0, textDropped = 0; unsigned long long lastBinMs = 0, lastTextMs = 0; };
++	SourceStats GetSourceStats() { std::lock_guard<std::mutex> lock(mtx); return stats; }
++
+ private:
++	void Compose(unsigned long long nowMs);
++	void ForgetSpacePoses(int space);
++	std::unordered_set<int> actionSpaces;
++	std::atomic<int> sourcePolicy{ 1 };
++	WxrHostState hostState;
++	WxrHostState injectState;
++	bool hasHost = false;
++	bool hasInject = false;
++	SourceStats stats;
+ 	int udpPort = 7872;
+ 	int udpSocket;
+ 	int udpSendPort = 7278;
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -294,6 +294,8 @@
+ // Profile picked over the ranking when the app suggested it, e.g. "/oculus/touch_controller"
+ static std::string preferredProfile;
+ static bool sendHaptics = true;
++// OXRWXR-NMS: 0 legacy, 1 merge (default), 2 host_only; conf.txt key tracking_source
++static int trackingSourcePolicy = 1;
+ 
+ static WinXrApiUDP* udpReader;
+ 
+@@ -309,6 +311,7 @@
+ static float FOVH = -1;
+ static float FOVV = -1;
+ 
++static std::mutex SpacePoseMutex;
+ static std::map<std::pair<XrSpace, XrSpace>, XrPosef> SpacePoses;
+ static std::map<std::pair<XrSpace, XrSpace>, XrSpaceVelocity> SpaceVelocities;
+ 
+@@ -547,6 +550,8 @@
+ 
+ // Cache for controllers to be created
+ static std::unordered_map<XrSpace, XrActionSpaceCreateInfo> g_controllerInfo;
++// Action spaces and reference-space overflow share one sequence to keep handles unique.
++static uintptr_t g_nextActionOrOverflowSpace = 200;
+ // Guards the controller maps: they are drained from xrLocateSpace (render thread) and xrSyncActions (game thread)
+ static std::mutex g_controllerMutex;
+ 
+@@ -1455,6 +1460,15 @@
+                     }
+                     if (compareKey(line, "controller_profile")) {
+                         preferredProfile = line.substr(line.find('=') + 1);
++                    }
++                    // OXRWXR-NMS: legacy | merge | host_only (see WinXrApiUDP.h)
++                    if (compareKey(line, "tracking_source")) {
++                        std::string v = line.substr(line.find('=') + 1);
++                        while (!v.empty() && (v.back() == '\r' || v.back() == '\n' || v.back() == ' ')) v.pop_back();
++                        while (!v.empty() && v.front() == ' ') v.erase(v.begin());
++                        if (v == "merge") trackingSourcePolicy = 1;
++                        else if (v == "host_only") trackingSourcePolicy = 2;
++                        else trackingSourcePolicy = 0;
+                     }
+                 }
+ 
+@@ -1471,6 +1485,9 @@
+ 
+     Logf("[WinXrUDP] Starting UDP");
+     udpReader = new WinXrApiUDP();
++    udpReader->SetSourcePolicy(trackingSourcePolicy);
++    Logf("[SimXR] OXRWXR-NMS build %s %s: tracking_source=%s (0=legacy 1=merge 2=host_only)",
++         __DATE__, __TIME__, trackingSourcePolicy == 1 ? "merge" : (trackingSourcePolicy == 2 ? "host_only" : "legacy"));
+     if (!udpReader->HasSocket()) Log("[WinXrUDP] ERROR - could not bind the UDP port, is another VR process already running? No tracking data will arrive");
+     udpReader->SendData("0 0 2 0");
+ 
+@@ -1847,10 +1864,14 @@
+         rt::g_controllerGrips.clear();
+         rt::g_controllerPoses.clear();
+         rt::g_controllerInfo.clear();
++        if (udpReader) udpReader->ClearSpaces();
+     }
+     rt::g_locateSpaces.clear();
+-    SpacePoses.clear();
+-    SpaceVelocities.clear();
++    {
++        std::lock_guard<std::mutex> lock(SpacePoseMutex);
++        SpacePoses.clear();
++        SpaceVelocities.clear();
++    }
+     rt::g_spacesChanged = true;
+     rt::g_sessionWasVR = false;
+     Log("[SimXR] xrDestroySession: SUCCESS");
+@@ -2722,26 +2743,29 @@
+     int recenterID = host.recenterId;
+ 
+     // Poses for XrLocateSpace
+-    for (const WxrHostPose& hostPose : host.poses) {
+-        XrPosef pose;
+-        pose.position = { hostPose.pose[0], hostPose.pose[1], hostPose.pose[2] };
+-        pose.orientation = { hostPose.pose[3], hostPose.pose[4], hostPose.pose[5], hostPose.pose[6] };
+-        XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
+-        velocity.velocityFlags = (XrSpaceVelocityFlags)hostPose.velocity[0];
+-        velocity.linearVelocity = { hostPose.velocity[1], hostPose.velocity[2], hostPose.velocity[3] };
+-        velocity.angularVelocity = { hostPose.velocity[4], hostPose.velocity[5], hostPose.velocity[6] };
++    {
++        std::lock_guard<std::mutex> lock(SpacePoseMutex);
++        for (const WxrHostPose& hostPose : host.poses) {
++            XrPosef pose;
++            pose.position = { hostPose.pose[0], hostPose.pose[1], hostPose.pose[2] };
++            pose.orientation = { hostPose.pose[3], hostPose.pose[4], hostPose.pose[5], hostPose.pose[6] };
++            XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
++            velocity.velocityFlags = (XrSpaceVelocityFlags)hostPose.velocity[0];
++            velocity.linearVelocity = { hostPose.velocity[1], hostPose.velocity[2], hostPose.velocity[3] };
++            velocity.angularVelocity = { hostPose.velocity[4], hostPose.velocity[5], hostPose.velocity[6] };
+ 
+-        std::pair<XrSpace, XrSpace> key;
+-        key.first = (XrSpace)(intptr_t)hostPose.space;
+-        key.second = (XrSpace)(intptr_t)hostPose.baseSpace;
+-        if (pose.orientation.x == 0 && pose.orientation.y == 0 && pose.orientation.z == 0 && pose.orientation.w == 0) {
+-            // Pair not located by the host
+-            SpaceVelocities.erase(key);
+-            SpacePoses.erase(key);
+-            continue;
++            std::pair<XrSpace, XrSpace> key;
++            key.first = (XrSpace)(intptr_t)hostPose.space;
++            key.second = (XrSpace)(intptr_t)hostPose.baseSpace;
++            if (pose.orientation.x == 0 && pose.orientation.y == 0 && pose.orientation.z == 0 && pose.orientation.w == 0) {
++                // Pair not located by the host
++                SpaceVelocities.erase(key);
++                SpacePoses.erase(key);
++                continue;
++            }
++            SpacePoses[key] = pose;
++            SpaceVelocities[key] = velocity;
+         }
+-        SpacePoses[key] = pose;
+-        SpaceVelocities[key] = velocity;
+     }
+ 
+     OpenXRFrameID = openXRFrameID;
+@@ -2807,6 +2831,58 @@
+     rt::g_leftController.gripValue = floats[5];
+     rt::g_rightController.triggerValue = floats[6];
+     rt::g_rightController.gripValue = floats[7];
++
++    // OXRWXR-NMS: once a second, the tracking source and the head pose the game will get.
++    // head_deg / head_cm change while the headset is moved.
++    {
++        static ULONGLONG lastTrackLogMs = 0;
++        static WinXrApiUDP::SourceStats lastStats;
++        static bool havePrevHead = false;
++        static XrPosef prevHead{};
++        static int trackLogCount = 0;
++        ULONGLONG nowMs = GetTickCount64();
++        if (nowMs - lastTrackLogMs >= 1000 && trackLogCount < 3600) {
++            lastTrackLogMs = nowMs;
++            trackLogCount++;
++            WinXrApiUDP::SourceStats st = udpReader->GetSourceStats();
++            // The head pair the game locates most: space 0 against the lowest-numbered base it asked for
++            const WxrHostPose* head = nullptr;
++            for (const WxrHostPose& p : host.poses) {
++                if (p.space != 0) continue;
++                if (p.pose[3] == 0 && p.pose[4] == 0 && p.pose[5] == 0 && p.pose[6] == 0) continue;
++                if (!head || p.baseSpace < head->baseSpace) head = &p;
++            }
++            float headDeg = -1.0f, headCm = -1.0f;
++            XrPosef hp{};
++            if (head) {
++                hp.position = { head->pose[0], head->pose[1], head->pose[2] };
++                hp.orientation = { head->pose[3], head->pose[4], head->pose[5], head->pose[6] };
++                if (havePrevHead) {
++                    float dot = fabsf(hp.orientation.x * prevHead.orientation.x + hp.orientation.y * prevHead.orientation.y +
++                                      hp.orientation.z * prevHead.orientation.z + hp.orientation.w * prevHead.orientation.w);
++                    if (dot > 1.0f) dot = 1.0f;
++                    headDeg = 2.0f * acosf(dot) / toRadians;
++                    float dx = hp.position.x - prevHead.position.x, dy = hp.position.y - prevHead.position.y, dz = hp.position.z - prevHead.position.z;
++                    headCm = sqrtf(dx * dx + dy * dy + dz * dz) * 100.0f;
++                }
++                prevHead = hp;
++                havePrevHead = true;
++            }
++            Logf("[SimXR] TRACKING policy=%d bin_pps=%llu text_pps=%llu text_dropped=%llu bin_age_ms=%lld text_age_ms=%lld "
++                 "host_ipd=%.4f used_ipd=%.4f head_base=%d head_pos=(%.3f,%.3f,%.3f) head_q=(%.3f,%.3f,%.3f,%.3f) head_deg=%.2f head_cm=%.2f "
++                 "L(stick=%.2f,%.2f trig=%.2f grip=%.2f X=%d Y=%d) R(stick=%.2f,%.2f trig=%.2f grip=%.2f A=%d B=%d) poses=%zu",
++                 udpReader->GetSourcePolicy(),
++                 st.binPackets - lastStats.binPackets, st.textPackets - lastStats.textPackets, st.textDropped - lastStats.textDropped,
++                 st.lastBinMs ? (long long)(nowMs - st.lastBinMs) : -1LL, st.lastTextMs ? (long long)(nowMs - st.lastTextMs) : -1LL,
++                 floats[8], IPDVal, head ? head->baseSpace : -1,
++                 hp.position.x, hp.position.y, hp.position.z, hp.orientation.x, hp.orientation.y, hp.orientation.z, hp.orientation.w,
++                 headDeg, headCm,
++                 floats[0], floats[1], floats[4], floats[5], (int)buttonBools[8], (int)buttonBools[9],
++                 floats[2], floats[3], floats[6], floats[7], (int)buttonBools[10], (int)buttonBools[11],
++                 host.poses.size());
++            lastStats = st;
++        }
++    }
+ 
+     LARGE_INTEGER now; QueryPerformanceCounter(&now);
+     // Convert QPC to nanoseconds using double to avoid overflow on MSVC
+@@ -5458,8 +5534,11 @@
+ // Add missing space/action functions for compatibility
+ static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(XrSession, const XrReferenceSpaceCreateInfo* info, XrSpace* space) {
+     if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
+-    static uintptr_t nextSpace = 100;
+-    *space = (XrSpace)(nextSpace++);
++    {
++        std::lock_guard<std::mutex> lock(rt::g_controllerMutex);
++        static uintptr_t nextReferenceSpace = 100;
++        *space = (XrSpace)(nextReferenceSpace < 200 ? nextReferenceSpace++ : rt::g_nextActionOrOverflowSpace++);
++    }
+     rt::g_referenceSpacePose[*space] = info->poseInReferenceSpace;
+     rt::g_referenceSpaceType[*space] = info->referenceSpaceType;
+     rt::g_spacesChanged = true;
+@@ -5475,9 +5554,21 @@
+     }
+     {
+         std::lock_guard<std::mutex> lock(rt::g_controllerMutex);
+-        if (rt::g_controllerSpaces.find(space) != rt::g_controllerSpaces.end()) {
+-            rt::g_controllerSpaces.erase(space);
+-            rt::g_controllerGrips.erase(space);
++        rt::g_controllerSpaces.erase(space);
++        rt::g_controllerGrips.erase(space);
++        rt::g_controllerPoses.erase(space);
++        rt::g_controllerInfo.erase(space);
++        if (udpReader) udpReader->ForgetSpace((int)(intptr_t)space);
++    }
++    {
++        std::lock_guard<std::mutex> lock(SpacePoseMutex);
++        for (auto it = SpacePoses.begin(); it != SpacePoses.end();) {
++            if (it->first.first == space || it->first.second == space) {
++                SpaceVelocities.erase(it->first);
++                it = SpacePoses.erase(it);
++            } else {
++                ++it;
++            }
+         }
+     }
+     for (auto it = rt::g_locateSpaces.begin(); it != rt::g_locateSpaces.end(); ) {
+@@ -5508,6 +5599,7 @@
+ 
+     if (verboseLogging) Logf("[SimXR] xrLocateSpace: Looking for space=%d in baseSpace=%d", (uint64_t)space, (uint64_t)baseSpace);
+ 
++    std::lock_guard<std::mutex> lock(SpacePoseMutex);
+     if (SpacePoses.find(key) != SpacePoses.end()) {
+         location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                   XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+@@ -5697,14 +5789,13 @@
+ }
+ 
+ static XrResult XRAPI_PTR xrCreateActionSpace_runtime(XrSession, const XrActionSpaceCreateInfo* info, XrSpace* space) {
+-    if (!info) return XR_ERROR_VALIDATION_FAILURE;
+-    static uintptr_t nextSpace = 200;
+-    *space = (XrSpace)(nextSpace++);
++    if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
+ 
+     {
+         std::lock_guard<std::mutex> lock(rt::g_controllerMutex);
+-        rt::g_controllerInfo[*space] = XrActionSpaceCreateInfo();
+-        memcpy(&rt::g_controllerInfo[*space], info, sizeof(XrActionSpaceCreateInfo));
++        *space = (XrSpace)(rt::g_nextActionOrOverflowSpace++);
++        rt::g_controllerInfo[*space] = *info;
++        if (udpReader) udpReader->RegisterActionSpace((int)(intptr_t)*space);
+     }
+ 
+     Logf("[SimXR] xrCreateActionSpace: space=%llu", (unsigned long long) * space);
+@@ -6169,6 +6260,29 @@
+         s.sync = g_syncCount;
+     }
+     return (s.current.x != s.previous.x || s.current.y != s.previous.y) ? XR_TRUE : XR_FALSE;
++}
++
++// OXRWXR-NMS: logs each action that crosses its pressed threshold, without verbose_logging.
++// Each line names the game's action when a controller input crosses its threshold.
++static void LogActionEdge(const char* kind, const XrActionStateGetInfo* info, float x, float y) {
++    static std::mutex edgeMutex;
++    static std::map<std::pair<XrAction, XrPath>, int> lastBucket;
++    static int edgeLogCount = 0;
++    float mag = (y == 0.0f) ? x : sqrtf(x * x + y * y);
++    int bucket = mag > 0.5f ? 1 : (mag < -0.5f ? -1 : 0);
++    std::lock_guard<std::mutex> lock(edgeMutex);
++    auto key = std::make_pair(info->action, info->subactionPath);
++    auto it = lastBucket.find(key);
++    if (it == lastBucket.end()) { lastBucket[key] = bucket; if (bucket == 0) return; }
++    else if (it->second == bucket) return;
++    else it->second = bucket;
++    if (edgeLogCount >= 2000) return;
++    edgeLogCount++;
++    auto nameIt = rt::g_actionNames.find(info->action);
++    Logf("[SimXR] ACTION_EDGE %s action=%s sub=%llu path=%s value=(%.2f,%.2f) state=%d sync=%llu",
++         kind, nameIt != rt::g_actionNames.end() ? nameIt->second.c_str() : "?",
++         (unsigned long long)info->subactionPath, GetActionName(info->action).c_str(), x, y, bucket,
++         (unsigned long long)g_syncCount);
+ }
+ 
+ static XrResult XRAPI_PTR xrGetActionStateBoolean_runtime(XrSession, const XrActionStateGetInfo* info, XrActionStateBoolean* state) {
+@@ -6179,6 +6293,7 @@
+ 
+     if (TryTypedBoolean(info, state)) {
+         state->changedSinceLastSync = ChangedSinceLastSync(info, state->currentState ? 1.0f : 0.0f);
++        LogActionEdge("bool", info, state->currentState ? 1.0f : 0.0f, 0.0f);
+         return XR_SUCCESS;
+     }
+ 
+@@ -6208,6 +6323,7 @@
+     state->currentState = buttonState ? XR_TRUE : XR_FALSE;
+     state->changedSinceLastSync = ChangedSinceLastSync(info, buttonState ? 1.0f : 0.0f);
+     state->isActive = name == "unbound" ? XR_FALSE : XR_TRUE; // No source on the queried hand
++    LogActionEdge("bool", info, buttonState ? 1.0f : 0.0f, 0.0f);
+     return XR_SUCCESS;
+ }
+ 
+@@ -6260,6 +6376,7 @@
+ 
+     if (TryTypedFloat(info, state)) {
+         state->changedSinceLastSync = ChangedSinceLastSync(info, state->currentState);
++        LogActionEdge("float", info, state->currentState, 0.0f);
+         return XR_SUCCESS;
+     }
+ 
+@@ -6290,6 +6407,7 @@
+     state->currentState = floatState;
+     state->changedSinceLastSync = ChangedSinceLastSync(info, floatState);
+     state->isActive = name == "unbound" ? XR_FALSE : XR_TRUE; // No source on the queried hand
++    LogActionEdge("float", info, floatState, 0.0f);
+     return XR_SUCCESS;
+ }
+ 
+@@ -6325,6 +6443,7 @@
+ 
+     if (TryTypedVector2f(info, state)) {
+         state->changedSinceLastSync = ChangedSinceLastSync(info, state->currentState.x, state->currentState.y);
++        LogActionEdge("vec2", info, state->currentState.x, state->currentState.y);
+         return XR_SUCCESS;
+     }
+ 
+@@ -6354,6 +6473,7 @@
+     state->currentState = vec2State;
+     state->changedSinceLastSync = ChangedSinceLastSync(info, vec2State.x, vec2State.y);
+     state->isActive = name == "unbound" ? XR_FALSE : XR_TRUE; // No source on the queried hand
++    LogActionEdge("vec2", info, vec2State.x, vec2State.y);
+     return XR_SUCCESS;
+ }
+ 

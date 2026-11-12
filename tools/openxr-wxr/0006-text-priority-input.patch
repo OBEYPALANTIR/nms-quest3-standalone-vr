@@ -1,0 +1,74 @@
+--- a/src/WinXrApiUDP.cpp
++++ b/src/WinXrApiUDP.cpp
+@@ -394,10 +394,12 @@
+ 	for (int i = 0; i < 8; i++) {
+ 		if (std::fabs(injectState.floats[i]) > 0.01f)
+ 			injectHasControllerInput = true;
+-		if (std::fabs(injectState.floats[i]) > std::fabs(state.floats[i]))
++		// text_priority_input: a fresh injected release (0.0) must beat a stuck physical value
++		if (textPriorityInput || std::fabs(injectState.floats[i]) > std::fabs(state.floats[i]))
+ 			state.floats[i] = injectState.floats[i];
+ 	}
+ 	for (int i = 0; i < 19; i++) {
++		if (textPriorityInput) state.buttons[i] = injectState.buttons[i];
+ 		if (injectState.buttons[i]) {
+ 			injectHasControllerInput = true;
+ 			state.buttons[i] = true;
+--- a/src/WinXrApiUDP.h
++++ b/src/WinXrApiUDP.h
+@@ -77,6 +77,7 @@
+ 	// 2 = host_only: text packets are ignored while a binary packet arrived in the last second
+ 	void SetSourcePolicy(int policy) { sourcePolicy = policy; }
+ 	int GetSourcePolicy() const { return sourcePolicy; }
++	void SetTextPriorityInput(bool on) { textPriorityInput = on; }
+ 	enum class PoseSource { Missing = 1, Host = 2, Text = 4 };
+ 	enum class RightPoseRole { Other, Aim, Grip };
+ 	static RightPoseRole ResolveRightPoseRole(int hand, std::string_view binding);
+@@ -103,6 +104,7 @@
+ 	void ForgetSpacePoses(int space);
+ 	std::unordered_set<int> actionSpaces;
+ 	std::atomic<int> sourcePolicy{ 1 };
++	std::atomic<bool> textPriorityInput{ false };
+ 	WxrHostState hostState;
+ 	WxrHostState injectState;
+ 	bool hasHost = false;
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -297,6 +297,7 @@
+ // OXRWXR-NMS: 0 legacy, 1 merge (default), 2 host_only; conf.txt key tracking_source
+ static int trackingSourcePolicy = 1;
+ static bool textPriorityRightPoses = false;
++static bool textPriorityInput = false;
+ static std::atomic<unsigned> rightPoseSources{0};  // Aim bits 0–2, grip bits 3–5.
+ 
+ static WinXrApiUDP* udpReader;
+@@ -1516,6 +1517,7 @@
+     }
+ 
+     textPriorityRightPoses = false;
++    textPriorityInput = false;
+     //Load the config for the SimXR runtime
+     if (std::filesystem::exists(confPath) && std::filesystem::is_directory(confPath)) {
+         if (std::filesystem::exists(confFile) && std::filesystem::is_regular_file(confFile)) {
+@@ -1562,6 +1564,9 @@
+                     if (compareKey(line, "text_priority_right_poses")) {
+                         textPriorityRightPoses = parseBool(line);
+                     }
++                    if (compareKey(line, "text_priority_input")) {
++                        textPriorityInput = parseBool(line);
++                    }
+                     // OXRWXR-NMS: legacy | merge | host_only (see WinXrApiUDP.h)
+                     if (compareKey(line, "tracking_source")) {
+                         std::string v = line.substr(line.find('=') + 1);
+@@ -1588,9 +1593,11 @@
+     Logf("[WinXrUDP] Starting UDP");
+     udpReader = new WinXrApiUDP();
+     udpReader->SetSourcePolicy(trackingSourcePolicy);
++    udpReader->SetTextPriorityInput(textPriorityInput && trackingSourcePolicy == 1);
+     Logf("[SimXR] OXRWXR-NMS build %s %s: tracking_source=%s (0=legacy 1=merge 2=host_only)",
+          __DATE__, __TIME__, trackingSourcePolicy == 1 ? "merge" : (trackingSourcePolicy == 2 ? "host_only" : "legacy"));
+     if (textPriorityRightPoses) Log("[SimXR] text_priority_right_poses enabled");
++    if (textPriorityInput && trackingSourcePolicy == 1) Log("[SimXR] text_priority_input enabled");
+     if (!udpReader->HasSocket()) Log("[WinXrUDP] ERROR - could not bind the UDP port, is another VR process already running? No tracking data will arrive");
+     udpReader->SendData("0 0 2 0");
+ 
